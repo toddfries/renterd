@@ -42,6 +42,7 @@ type (
 		Log DatabaseLog `yaml:"log,omitempty"` // deprecated. included for compatibility.
 		// optional fields depending on backend
 		MySQL MySQL `yaml:"mysql,omitempty"`
+		PostgreSQL PostgreSQL `yaml:"postgresql,omitempty"`
 	}
 
 	// Bus contains the configuration for a bus.
@@ -89,6 +90,15 @@ type (
 
 	// MySQL contains the configuration for a MySQL database.
 	MySQL struct {
+		URI             string `yaml:"uri,omitempty"`
+		User            string `yaml:"user,omitempty"`
+		Password        string `yaml:"password,omitempty"`
+		Database        string `yaml:"database,omitempty"`
+		MetricsDatabase string `yaml:"metricsDatabase,omitempty"`
+	}
+
+	// PostgreSQL contains the configuration for a PostgreSQL database.
+	PostgreSQL struct {
 		URI             string `yaml:"uri,omitempty"`
 		User            string `yaml:"user,omitempty"`
 		Password        string `yaml:"password,omitempty"`
