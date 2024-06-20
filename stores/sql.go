@@ -15,10 +15,12 @@ import (
 	"go.sia.tech/renterd/api"
 	"go.sia.tech/renterd/stores/sql"
 	"go.sia.tech/renterd/stores/sql/mysql"
+	"go.sia.tech/renterd/stores/sql/postgresql"
 	"go.sia.tech/renterd/stores/sql/sqlite"
 	"go.sia.tech/siad/modules"
 	"go.uber.org/zap"
 	gmysql "gorm.io/driver/mysql"
+	gpostgres "gorm.io/driver/postgres"
 	gsqlite "gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	glogger "gorm.io/gorm/logger"
@@ -151,6 +153,12 @@ func NewMySQLConnection(user, password, addr, dbName string) gorm.Dialector {
 	return gmysql.Open(fmt.Sprintf("%s:%s@tcp(%s)/%s?charset=utf8mb4&parseTime=True&loc=Local&multiStatements=true", user, password, addr, dbName))
 }
 
+// NewPostgreSQLConnection creates a connection to a PostgreSQL database.
+func NewPostgreSQLConnection(host, user, password, dbName string, port int) gorm.Dialector {
+	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%d sslmode=disable TimeZone=UTC", host, user, password, dbName, port)
+	return gpostgres.Open(dsn)
+}
+
 // NewSQLStore uses a given Dialector to connect to a SQL database.  NOTE: Only
 // pass migrate=true for the first instance of SQLHostDB if you connect via the
 // same Dialector multiple times.
@@ -192,16 +200,23 @@ func NewSQLStore(cfg Config) (*SQLStore, modules.ConsensusChangeID, error) {
 	var dbMain sql.Database
 	var bMetrics sql.MetricsDatabase
 	var mainErr, metricsErr error
-	if cfg.Conn.Name() == "sqlite" {
+	switch cfg.Conn.Name() {
+	case "sqlite":
 		dbMain, mainErr = sqlite.NewMainDatabase(sqlDB, l, cfg.LongQueryDuration, cfg.LongTxDuration)
 		bMetrics, metricsErr = sqlite.NewMetricsDatabase(sqlDBMetrics, l, cfg.LongQueryDuration, cfg.LongTxDuration)
-	} else {
+	case "mysql":
 		dbMain, mainErr = mysql.NewMainDatabase(sqlDB, l, cfg.LongQueryDuration, cfg.LongTxDuration)
 		bMetrics, metricsErr = mysql.NewMetricsDatabase(sqlDBMetrics, l, cfg.LongQueryDuration, cfg.LongTxDuration)
+	case "postgresql":
+		dbMain, mainErr = postgresql.NewMainDatabase(sqlDB, l, cfg.LongQueryDuration, cfg.LongTxDuration)
+		bMetrics, metricsErr = postgresql.NewMetricsDatabase(sqlDBMetrics, l, cfg.LongQueryDuration, cfg.LongTxDuration)
+	default:
+		return nil, modules.ConsensusChangeID{}, fmt.Errorf("unsupported database type: %v", cfg.Conn.Name())
 	}
 	if mainErr != nil {
 		return nil, modules.ConsensusChangeID{}, fmt.Errorf("failed to create main database: %v", mainErr)
-	} else if metricsErr != nil {
+	}
+	if metricsErr != nil {
 		return nil, modules.ConsensusChangeID{}, fmt.Errorf("failed to create metrics database: %v", metricsErr)
 	}
 
@@ -294,6 +309,8 @@ func isSQLite(db *gorm.DB) bool {
 	case *gsqlite.Dialector:
 		return true
 	case *gmysql.Dialector:
+		return false
+	case *gpostgresql.Dialector:
 		return false
 	default:
 		panic(fmt.Sprintf("unknown dialector: %t", db.Dialector))
@@ -574,3 +591,4 @@ func (s *SQLStore) ResetConsensusSubscription(ctx context.Context) error {
 	s.persistMu.Unlock()
 	return nil
 }
+
