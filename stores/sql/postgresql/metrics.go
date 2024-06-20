@@ -1,77 +1,121 @@
-package metrics
+package mysql
 
 import (
-    "database/sql"
-    "fmt"
-    "log"
-    "time"
+	"context"
+	"encoding/hex"
+	"time"
 
-    _ "github.com/lib/pq" // PostgreSQL driver
+	dsql "database/sql"
+
+	"go.sia.tech/renterd/api"
+	"go.sia.tech/renterd/internal/sql"
+	ssql "go.sia.tech/renterd/stores/sql"
+	"lukechampine.com/frand"
+
+	"go.uber.org/zap"
 )
 
-type MetricsDB struct {
-    db *sql.DB
+type (
+	MetricsDatabase struct {
+		log *zap.SugaredLogger
+		db  *sql.DB
+	}
+
+	MetricsDatabaseTx struct {
+		sql.Tx
+		log *zap.SugaredLogger
+	}
+)
+
+var _ ssql.MetricsDatabaseTx = (*MetricsDatabaseTx)(nil)
+
+// NewMetricsDatabase creates a new PostgreSQL backend.
+func NewMetricsDatabase(db *dsql.DB, log *zap.SugaredLogger, lqd, ltd time.Duration) (*MetricsDatabase, error) {
+	store, err := sql.NewDB(db, log.Desugar(), deadlockMsgs, lqd, ltd)
+	return &MetricsDatabase{
+		db:  store,
+		log: log,
+	}, err
 }
 
-func NewMetricsDB(dbURI string) (*MetricsDB, error) {
-    db, err := sql.Open("postgres", dbURI)
-    if err != nil {
-        return nil, fmt.Errorf("failed to connect to database: %v", err)
-    }
-
-    err = db.Ping()
-    if err != nil {
-        return nil, fmt.Errorf("failed to ping database: %v", err)
-    }
-
-    return &MetricsDB{db: db}, nil
+func (b *MetricsDatabase) ApplyMigration(ctx context.Context, fn func(tx sql.Tx) (bool, error)) error {
+	return applyMigration(ctx, b.db, fn)
 }
 
-func (m *MetricsDB) Close() {
-    m.db.Close()
+func (b *MetricsDatabase) Close() error {
+	return b.db.Close()
 }
 
-func (m *MetricsDB) AddMetric(metric string, value float64) error {
-    _, err := m.db.Exec("INSERT INTO metrics (metric, value, timestamp) VALUES ($1, $2, $3)", metric, value, time.Now())
-    return err
+func (b *MetricsDatabase) DB() *sql.DB {
+	return b.db
 }
 
-func (m *MetricsDB) GetMetrics(metric string) ([]Metric, error) {
-    rows, err := m.db.Query("SELECT value, timestamp FROM metrics WHERE metric = $1 ORDER BY timestamp DESC", metric)
-    if err != nil {
-        return nil, err
-    }
-    defer rows.Close()
-
-    var metrics []Metric
-    for rows.Next() {
-        var m Metric
-        err := rows.Scan(&m.Value, &m.Timestamp)
-        if err != nil {
-            return nil, err
-        }
-        metrics = append(metrics, m)
-    }
-
-    if err := rows.Err(); err != nil {
-        return nil, err
-    }
-
-    return metrics, nil
+func (b *MetricsDatabase) CreateMigrationTable(ctx context.Context) error {
+	return createMigrationTable(ctx, b.db)
 }
 
-type Metric struct {
-    Value     float64
-    Timestamp time.Time
+func (b *MetricsDatabase) Migrate(ctx context.Context) error {
+	return sql.PerformMigrations(ctx, b, migrationsFs, "metrics", sql.MetricsMigrations(ctx, migrationsFs, b.log))
 }
 
-func (m *MetricsDB) Migrate() error {
-    _, err := m.db.Exec(`
-        CREATE TABLE IF NOT EXISTS metrics (
-            id SERIAL PRIMARY KEY,
-            metric VARCHAR(255) NOT NULL,
-            value FLOAT NOT NULL,
-            timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );`)
-    return err
+func (b *MetricsDatabase) Transaction(ctx context.Context, fn func(tx ssql.MetricsDatabaseTx) error) error {
+	return b.db.Transaction(ctx, func(tx sql.Tx) error {
+		return fn(b.wrapTxn(tx))
+	})
+}
+
+func (b *MetricsDatabase) Version(ctx context.Context) (string, string, error) {
+	return version(ctx, b.db)
+}
+
+func (b *MetricsDatabase) wrapTxn(tx sql.Tx) *MetricsDatabaseTx {
+	return &MetricsDatabaseTx{tx, b.log.Named(hex.EncodeToString(frand.Bytes(16)))}
+}
+
+func (tx *MetricsDatabaseTx) ContractMetrics(ctx context.Context, start time.Time, n uint64, interval time.Duration, opts api.ContractMetricsQueryOpts) ([]api.ContractMetric, error) {
+	return ssql.ContractMetrics(ctx, tx, start, n, interval, ssql.ContractMetricsQueryOpts{ContractMetricsQueryOpts: opts, IndexHint: "SET enable_indexscan = 'idx_contracts_fcid_timestamp'"})
+}
+
+func (tx *MetricsDatabaseTx) ContractPruneMetrics(ctx context.Context, start time.Time, n uint64, interval time.Duration, opts api.ContractPruneMetricsQueryOpts) ([]api.ContractPruneMetric, error) {
+	return ssql.ContractPruneMetrics(ctx, tx, start, n, interval, opts)
+}
+
+func (tx *MetricsDatabaseTx) ContractSetChurnMetrics(ctx context.Context, start time.Time, n uint64, interval time.Duration, opts api.ContractSetChurnMetricsQueryOpts) ([]api.ContractSetChurnMetric, error) {
+	return ssql.ContractSetChurnMetrics(ctx, tx, start, n, interval, opts)
+}
+
+func (tx *MetricsDatabaseTx) ContractSetMetrics(ctx context.Context, start time.Time, n uint64, interval time.Duration, opts api.ContractSetMetricsQueryOpts) (metrics []api.ContractSetMetric, _ error) {
+	return ssql.ContractSetMetrics(ctx, tx, start, n, interval, opts)
+}
+
+func (tx *MetricsDatabaseTx) PerformanceMetrics(ctx context.Context, start time.Time, n uint64, interval time.Duration, opts api.PerformanceMetricsQueryOpts) ([]api.PerformanceMetric, error) {
+	return ssql.PerformanceMetrics(ctx, tx, start, n, interval, opts)
+}
+
+func (tx *MetricsDatabaseTx) RecordContractMetric(ctx context.Context, metrics ...api.ContractMetric) error {
+	return ssql.RecordContractMetric(ctx, tx, metrics...)
+}
+
+func (tx *MetricsDatabaseTx) RecordContractPruneMetric(ctx context.Context, metrics ...api.ContractPruneMetric) error {
+	return ssql.RecordContractPruneMetric(ctx, tx, metrics...)
+}
+
+func (tx *MetricsDatabaseTx) RecordContractSetChurnMetric(ctx context.Context, metrics ...api.ContractSetChurnMetric) error {
+	return ssql.RecordContractSetChurnMetric(ctx, tx, metrics...)
+}
+
+func (tx *MetricsDatabaseTx) RecordContractSetMetric(ctx context.Context, metrics ...api.ContractSetMetric) error {
+	return ssql.RecordContractSetMetric(ctx, tx, metrics...)
+}
+
+func (tx *MetricsDatabaseTx) RecordPerformanceMetric(ctx context.Context, metrics ...api.PerformanceMetric) error {
+	return ssql.RecordPerformanceMetric(ctx, tx, metrics...)
+}
+
+func (tx *MetricsDatabaseTx) RecordWalletMetric(ctx context.Context, metrics ...api.WalletMetric) error {
+	return ssql.RecordWalletMetric(ctx, tx, metrics...)
+}
+
+func (tx *MetricsDatabaseTx) WalletMetrics(ctx context.Context, start time.Time, n uint64, interval time.Duration, opts api.WalletMetricsQueryOpts) ([]api.WalletMetric, error) {
+	return ssql.WalletMetrics(ctx, tx, start, n, interval, opts)
 }
