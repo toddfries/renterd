@@ -1,4 +1,4 @@
-package mysql
+package postgresql
 
 import (
 	"context"
@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/lib/pq"
 	"go.sia.tech/core/types"
 	"go.sia.tech/renterd/api"
 	"go.sia.tech/renterd/object"
@@ -148,10 +149,17 @@ func (tx *MainDatabaseTx) AddWebhook(ctx context.Context, wh webhooks.Webhook) e
 		INSERT INTO webhooks (created_at, module, event, url, headers)
 		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT (module, event, url)
-		DO UPDATE SET headers = EXCLUDED.headers`,
+		DO UPDATE SET headers = EXCLUDED.headers
+		RETURNING id`,
 		time.Now(), wh.Module, wh.Event, wh.URL, headers)
 	if err != nil {
-		return fmt.Errorf("failed to insert webhook: %w", err)
+		return fmt.Errorf("failed to insert/update webhook: %w", err)
+	}
+
+	var id int64
+	err = result.Scan(&id)
+	if err != nil {
+		return fmt.Errorf("failed to get inserted/updated webhook ID: %w", err)
 	}
 	return nil
 }
@@ -614,14 +622,14 @@ func (tx MainDatabaseTx) SaveAccounts(ctx context.Context, accounts []api.Accoun
 	// clean_shutdown = 1 after save
 	stmt, err := tx.Prepare(ctx, `
 		INSERT INTO ephemeral_accounts (created_at, account_id, clean_shutdown, host, balance, drift, requires_sync)
-		VAlUES (?, ?, 1, ?, ?, ?, ?)
-		ON DUPLICATE KEY UPDATE
-		account_id = VALUES(account_id),
-		clean_shutdown = 1,
-		host = VALUES(host),
-		balance = VALUES(balance),
-		drift = VALUES(drift),
-		requires_sync = VALUES(requires_sync)
+		VAlUES ($1, $2, true, $3, $4, $5, R6)
+		ON CONFLICT (account_id) DO UPDATE
+		SET
+			clean_shutdown = u
+			host = VALUES(host),
+			balance = VALUES(balance),
+			drift = VALUES(drift),
+			requires_sync = VALUES(requires_sync)
 	`)
 	if err != nil {
 		return err
